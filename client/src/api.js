@@ -54,3 +54,7 @@ export function anonymizeSamples(samples, rules) {
 export function sliceContract(schema, samples, pointers) {
   return request("/api/slice", { schema, samples, pointers });
 }
+
+export function migrateSamples(baselineSchema, currentSchema, samples, mappings) {
+  return request("/api/migrate", { baselineSchema, currentSchema, samples, mappings });
+}

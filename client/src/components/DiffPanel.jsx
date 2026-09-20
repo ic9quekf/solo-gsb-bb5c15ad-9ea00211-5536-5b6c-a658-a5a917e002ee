@@ -3,6 +3,7 @@ import { diffSchemas } from "../api.js";
 import ReleaseGate from "./ReleaseGate.jsx";
 import CounterexamplePanel from "./CounterexamplePanel.jsx";
 import SampleScanPanel from "./SampleScanPanel.jsx";
+import MigrationPanel from "./MigrationPanel.jsx";
 
 const KIND_LABELS = {
   type: "类型联合变化",
@@ -223,6 +224,7 @@ export default function DiffPanel({ baseline, current, onSaveBaseline, onClearBa
           )}
 
           <SampleScanPanel baselineSchema={baseline.schema} currentSchema={currentSchema} />
+          <MigrationPanel baselineSchema={baseline.schema} currentSchema={currentSchema} />
         </>
       )}
     </div>

@@ -558,6 +558,139 @@ test("POST /api/slice validates its input", async () => {
   assert.match(unresolvable.data.invalidPointers[0].reason, /未命中/);
 });
 
+test("POST /api/migrate moves historical samples and groups success/conflict/invalid", async () => {
+  const oldS = (
+    await post("/api/infer", { samples: [{ id: 1, phone: "a" }, { id: 2, phone: null }] })
+  ).data.schema;
+  const newS = (
+    await post("/api/infer", {
+      samples: [{ id: 1, contact: { phone: "a" } }, { id: 2, contact: { phone: "b" } }],
+    })
+  ).data.schema;
+
+  const res = await post("/api/migrate", {
+    baselineSchema: oldS,
+    currentSchema: newS,
+    samples: [
+      { id: 1, phone: "123" }, // success
+      { id: 2, contact: { phone: "x" } }, // success: missing source, nothing to move
+      { id: 3, phone: "1", contact: { phone: "2" } }, // conflict: target pre-exists
+      { id: 4, phone: 9 }, // invalid: number not accepted at contact/phone
+    ],
+    mappings: [{ from: "/phone", to: "/contact/phone" }],
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.data.total, 4);
+  assert.deepEqual(res.data.summary, { success: 2, conflict: 1, invalid: 1 });
+  // The plan orders operations by depth before touching any sample.
+  assert.ok(Array.isArray(res.data.plan.sourceRemovals));
+  assert.ok(Array.isArray(res.data.plan.targetWrites));
+  assert.deepEqual(res.data.mappings, [
+    { index: 0, from: "/phone", to: "/contact/phone", hasDefault: false },
+  ]);
+
+  const [success, skipped, conflict, invalid] = res.data.samples;
+  assert.deepEqual(success.after, { id: 1, contact: { phone: "123" } });
+  assert.equal(success.current.valid, true);
+  assert.equal(success.baseline.valid, true);
+  assert.equal(skipped.operations[0].kind, "skip");
+
+  assert.equal(conflict.status, "conflict");
+  assert.equal(conflict.after, null);
+  assert.deepEqual(conflict.before, { id: 3, phone: "1", contact: { phone: "2" } });
+  assert.match(conflict.reasons[0], /contact\/phone/);
+
+  assert.equal(invalid.status, "invalid");
+  assert.deepEqual(invalid.after, { id: 4, contact: { phone: 9 } });
+  assert.equal(invalid.current.valid, false);
+  assert.equal(invalid.current.errors[0].pointer, "/contact/phone");
+  assert.equal(invalid.current.errors[0].keyword, "type");
+});
+
+test("POST /api/migrate supports defaults, arrays (-) and depth-planned parent/child sources", async () => {
+  const res = await post("/api/migrate", {
+    currentSchema: {},
+    samples: [{ id: 1, phone: "x", meta: { tags: ["a"], v: 2 } }],
+    mappings: [
+      { from: "/phone", to: "/contact/phone" },
+      { from: "/meta/tags/0", to: "/extra/tags/-" },
+      { from: "/version", to: "/v", default: 1 },
+    ],
+  });
+  assert.equal(res.status, 200);
+  const item = res.data.samples[0];
+  assert.equal(item.status, "success");
+  assert.deepEqual(item.after, {
+    id: 1,
+    meta: { tags: [], v: 2 },
+    contact: { phone: "x" },
+    extra: { tags: ["a"] },
+    v: 1,
+  });
+  // Deepest source removal is planned before its ancestors.
+  assert.equal(res.data.plan.sourceRemovals[0].pointer, "/meta/tags/0");
+});
+
+test("POST /api/migrate rejects invalid mappings with 422 and details", async () => {
+  const badPointer = await post("/api/migrate", {
+    currentSchema: {},
+    samples: [{ a: 1 }],
+    mappings: [{ from: "a", to: "/b" }],
+  });
+  assert.equal(badPointer.status, 422);
+  assert.equal(badPointer.data.invalidMappings[0].index, 0);
+
+  const overlap = await post("/api/migrate", {
+    currentSchema: {},
+    samples: [{ a: 1, b: 2 }],
+    mappings: [
+      { from: "/a", to: "/x" },
+      { from: "/b", to: "/x/y" },
+    ],
+  });
+  assert.equal(overlap.status, 422);
+  assert.equal(overlap.data.invalidMappings[0].index, 1);
+  assert.match(overlap.data.error, /父子重叠/);
+  // No per-sample output when the mapping set itself is invalid.
+  assert.equal(overlap.data.samples, undefined);
+});
+
+test("POST /api/migrate validates its input", async () => {
+  const noSchema = await post("/api/migrate", {
+    samples: [1],
+    mappings: [{ from: "/a", to: "/b" }],
+  });
+  assert.equal(noSchema.status, 400);
+  assert.match(noSchema.data.error, /currentSchema/);
+
+  const noSamples = await post("/api/migrate", {
+    currentSchema: {},
+    mappings: [{ from: "/a", to: "/b" }],
+  });
+  assert.equal(noSamples.status, 400);
+  assert.match(noSamples.data.error, /'samples' array/);
+
+  const noMappings = await post("/api/migrate", { currentSchema: {}, samples: [1] });
+  assert.equal(noMappings.status, 400);
+  assert.match(noMappings.data.error, /'mappings' array/);
+
+  const tooMany = await post("/api/migrate", {
+    currentSchema: {},
+    samples: Array.from({ length: 201 }, () => 1),
+    mappings: [{ from: "/a", to: "/b" }],
+  });
+  assert.equal(tooMany.status, 400);
+  assert.match(tooMany.data.error, /200/);
+
+  const invalidSchema = await post("/api/migrate", {
+    currentSchema: { type: "nope" },
+    samples: [1],
+    mappings: [{ from: "/a", to: "/b" }],
+  });
+  assert.equal(invalidSchema.status, 422);
+  assert.match(invalidSchema.data.error, /Invalid schema/);
+});
+
 test("malformed JSON body gets a JSON 400", async () => {
   const res = await fetch(`${base}/api/infer`, {
     method: "POST",
