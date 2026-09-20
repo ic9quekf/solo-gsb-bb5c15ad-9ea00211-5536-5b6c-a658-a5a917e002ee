@@ -558,6 +558,198 @@ test("POST /api/slice validates its input", async () => {
   assert.match(unresolvable.data.invalidPointers[0].reason, /未命中/);
 });
 
+test("POST /api/migrate moves fields, fills defaults and summarizes against the current schema", async () => {
+  const oldS = {
+    type: "object",
+    properties: {
+      id: { type: "integer" },
+      phone: { type: ["null", "string"] },
+      mobile: { type: "string" },
+    },
+    required: ["id"],
+  };
+  const newS = {
+    type: "object",
+    properties: {
+      id: { type: "integer" },
+      mobile: { type: "string" },
+      vip: { type: "boolean" },
+    },
+    required: ["id", "mobile", "vip"],
+  };
+  const res = await post("/api/migrate", {
+    oldSchema: oldS,
+    newSchema: newS,
+    samples: [
+      { id: 1, phone: "138" }, // migrated + valid
+      { id: 2 }, // both defaults applied, valid
+      { id: 3, mobile: "x", vip: false }, // both targets already hold values -> no-op
+      { id: 4, phone: 9 }, // migrated but invalid under newSchema (type)
+    ],
+    mappings: [
+      { from: "/phone", to: "/mobile", default: "unknown" },
+      { from: "/vip", to: "/vip", default: true },
+    ],
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.data.total, 4);
+  assert.deepEqual(res.data.summary, {
+    migrated: 3,
+    conflict: 0,
+    noop: 1,
+    valid: 3,
+    invalid: 1,
+  });
+
+  const [s0, s1, s2, s3] = res.data.samples;
+  assert.equal(s0.status, "migrated");
+  assert.deepEqual(s0.after, { id: 1, mobile: "138", vip: true });
+  assert.equal(s0.current.valid, true);
+  assert.equal(s0.baseline.valid, true);
+
+  assert.equal(s1.status, "migrated");
+  assert.deepEqual(s1.after, { id: 2, mobile: "unknown", vip: true });
+  assert.equal(s1.current.valid, true);
+
+  assert.equal(s2.status, "noop");
+  assert.equal(s2.after, null);
+  assert.deepEqual(s2.before, { id: 3, mobile: "x", vip: false });
+  assert.equal(s2.current.valid, true);
+
+  assert.equal(s3.status, "migrated");
+  assert.equal(s3.current.valid, false);
+  assert.equal(s3.current.errors[0].pointer, "/mobile");
+
+  // Copy-successful payload: exactly the migrated + current-valid docs.
+  assert.deepEqual(res.data.successfulSamples, [
+    { id: 1, mobile: "138", vip: true },
+    { id: 2, mobile: "unknown", vip: true },
+  ]);
+});
+
+test("POST /api/migrate leaves conflicting samples untouched and explains the reason", async () => {
+  const res = await post("/api/migrate", {
+    oldSchema: {},
+    newSchema: {},
+    samples: [{ id: 3, phone: null, mobile: "existing" }],
+    mappings: [{ from: "/phone", to: "/mobile" }],
+  });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.data.summary, { migrated: 0, conflict: 1, noop: 0, valid: 1, invalid: 0 });
+  const item = res.data.samples[0];
+  assert.equal(item.status, "conflict");
+  assert.equal(item.after, null);
+  assert.match(item.reason, /已存在值/);
+  assert.deepEqual(item.before, { id: 3, phone: null, mobile: "existing" });
+  assert.deepEqual(res.data.successfulSamples, []);
+});
+
+test("POST /api/migrate handles array elements and parent/child source overlap", async () => {
+  const res = await post("/api/migrate", {
+    oldSchema: {},
+    newSchema: {
+      type: "object",
+      properties: {
+        kept: { type: "integer" },
+        rest: { type: "object" },
+        city: { type: "string" },
+      },
+    },
+    samples: [{ tags: [3, 4, 5], meta: { city: "SH", zip: "200000" } }],
+    mappings: [
+      { from: "/tags/2", to: "/kept" },
+      { from: "/tags/0", to: "/picked0" },
+      { from: "/meta/city", to: "/city" },
+      { from: "/meta", to: "/rest" },
+    ],
+  });
+  assert.equal(res.status, 200);
+  const item = res.data.samples[0];
+  assert.equal(item.status, "migrated");
+  // Highest array index removed first: 5 then 3, leaving 4.
+  assert.deepEqual(item.after.tags, [4]);
+  assert.equal(item.after.kept, 5);
+  assert.equal(item.after.picked0, 3);
+  // Deepest source first: city leaves before meta is moved.
+  assert.equal(item.after.city, "SH");
+  assert.deepEqual(item.after.rest, { zip: "200000" });
+});
+
+test("POST /api/migrate refuses planner errors with 422 + mappingErrors", async () => {
+  const res = await post("/api/migrate", {
+    oldSchema: {},
+    newSchema: {},
+    samples: [{ a: 1 }],
+    mappings: [{ from: "bad", to: "/x" }],
+  });
+  assert.equal(res.status, 422);
+  assert.ok(Array.isArray(res.data.mappingErrors));
+  assert.equal(res.data.mappingErrors[0].index, 0);
+  assert.match(res.data.mappingErrors[0].reason, /Pointer 非法/);
+  assert.equal(res.data.samples, undefined);
+});
+
+test("POST /api/migrate validates its input", async () => {
+  const noSchema = await post("/api/migrate", {
+    samples: [{}],
+    mappings: [{ from: "/a", to: "/b" }],
+  });
+  assert.equal(noSchema.status, 400);
+  assert.match(noSchema.data.error, /oldSchema|newSchema/);
+
+  const noSamples = await post("/api/migrate", {
+    oldSchema: {},
+    newSchema: {},
+    mappings: [{ from: "/a", to: "/b" }],
+  });
+  assert.equal(noSamples.status, 400);
+  assert.match(noSamples.data.error, /samples' array/);
+
+  const noMappings = await post("/api/migrate", {
+    oldSchema: {},
+    newSchema: {},
+    samples: [{}],
+  });
+  assert.equal(noMappings.status, 400);
+  assert.match(noMappings.data.error, /mappings' array/);
+
+  const badMapping = await post("/api/migrate", {
+    oldSchema: {},
+    newSchema: {},
+    samples: [{}],
+    mappings: [{ from: 1, to: "/b" }],
+  });
+  assert.equal(badMapping.status, 400);
+  assert.match(badMapping.data.error, /'from' and 'to'/);
+
+  const tooManySamples = await post("/api/migrate", {
+    oldSchema: {},
+    newSchema: {},
+    samples: Array.from({ length: 201 }, () => ({})),
+    mappings: [{ from: "/a", to: "/b" }],
+  });
+  assert.equal(tooManySamples.status, 400);
+  assert.match(tooManySamples.data.error, /200/);
+
+  const tooManyMappings = await post("/api/migrate", {
+    oldSchema: {},
+    newSchema: {},
+    samples: [{}],
+    mappings: Array.from({ length: 21 }, (_, i) => ({ from: `/a${i}`, to: `/b${i}` })),
+  });
+  assert.equal(tooManyMappings.status, 400);
+  assert.match(tooManyMappings.data.error, /20/);
+
+  const invalidSchema = await post("/api/migrate", {
+    oldSchema: { type: "nope" },
+    newSchema: {},
+    samples: [{}],
+    mappings: [{ from: "/a", to: "/b" }],
+  });
+  assert.equal(invalidSchema.status, 422);
+  assert.match(invalidSchema.data.error, /Invalid schema/);
+});
+
 test("malformed JSON body gets a JSON 400", async () => {
   const res = await fetch(`${base}/api/infer`, {
     method: "POST",

@@ -8,6 +8,10 @@
 为每条破坏性变更加载**反例样本**（递归构造最小 JSON 并用 Ajv 双侧校验），
 用**样本影响扫描**把历史样本集按基线/当前 Schema 逐条校验并归类（两版均通过、仅基线通过、
 仅当前通过、两版均失败），
+并可在同一页做**历史样本迁移**——粘贴旧样本并配置「源 JSON Pointer → 目标 JSON Pointer」映射
+（含可选默认值），后端先按路径深度规划、再逐条原子移动/补值（正确处理数组元素、父子路径重叠与
+目标冲突，冲突样本保持原样并说明原因），迁移后用 Ajv 校验当前 Schema，按成功/冲突/校验失败汇总，
+可展开前后对比并复制仅成功结果；
 通过**发布门禁**结合基线/目标 SemVer 给出允许或阻止发布的结论与可复制报告，
 并可按**判别字段**把样本分组生成**事件变体契约**（每组复用归纳引擎生成一个 `oneOf` 分支，
 分支内判别字段固定为对应 `const`）；
@@ -64,6 +68,14 @@ docker compose up --build
   **基线**与**当前** Schema 校验，归类为「两版均通过 / 仅基线通过 / 仅当前通过 / 两版均失败」；
   结果区按类展示数量与样本索引（`#0`、`#1`…），展开单条可查看两侧错误的 JSON Pointer、关键字与信息。
   单次最多 200 条，超限或输入非数组时前后端都会给出明确错误。
+- **历史样本迁移**：在演进页粘贴旧样本 JSON 数组并配置多条「源 JSON Pointer → 目标 JSON Pointer」
+  映射（可填 JSON 默认值）。后端**先规划后执行**：先校验 Pointer 合法性并检查跨映射的路径嵌套，
+  再按源路径深度**从深到浅**逐条样本原子执行——命中的源被**移动**（先剪切再粘贴，含中间容器自动
+  创建），缺失的源在配置默认值时**补值**；数组按下标从大到小删除避免位移，目标端支持 RFC 6902
+  的 `-` 追加符；目标已存在值时拒绝覆盖（补值则保留原值），结构不兼容（向数组写键、穿过标量、
+  下标越界等）同样判为冲突。**冲突样本保持原样**并给出具体原因与逐条操作轨迹。迁移结果再用 Ajv
+  按当前 Schema 校验，界面按「成功（通过当前 Schema）/ 校验失败 / 冲突 / 无变化」汇总，单条可展开
+  迁移前后对比、操作明细与两侧 Ajv 错误，并一键**复制仅成功结果**。单次最多 200 条样本、20 条映射。
 - **发布门禁**：在演进页填写基线版本（当前 SemVer）与目标版本（新版 SemVer），门禁复用当前
   `/api/diff` 差异汇总即时给出「允许/阻止发布」结论，展示实际升级类型、触发结论的变更数量与
   原因，并可复制包含版本、视角、汇总与结论的 JSON 报告；切换视角或修改版本号都会即时重算。
@@ -93,6 +105,9 @@ docker compose up --build
 5. 在「样本影响扫描」卡片粘贴历史样本的 JSON 数组并点击「开始扫描」：结果按四类分组展示
    数量与样本索引，点击单条样本可展开基线/当前两侧的 Ajv 校验详情（Pointer、关键字、信息）。
 6. 在「发布门禁」卡片填写基线版本与目标版本（SemVer），即时得到放行结论，需要时可复制门禁报告。
+7. 在「历史样本迁移」卡片粘贴旧样本数组，配置「源 Pointer → 目标 Pointer」映射（可填默认值）后
+   点击「开始迁移」：结果按成功 / 校验失败 / 冲突 / 无变化分组，展开单条查看前后对比与操作明细，
+   用「复制仅成功结果」一键导出通过当前 Schema 的迁移样本。
 
 基线仅保存在当前浏览器会话（`sessionStorage`）：刷新页面仍在，关闭标签页即失效，不会上传到服务器持久化。
 门禁填写的两个版本号同样仅保存在当前浏览器会话。
@@ -160,6 +175,48 @@ Schema，再**逐条移除一条样本**重新归纳，比较两份 Schema 的�
 - 结果按类分组展示数量与样本索引（`#` 前缀为样本在数组中的下标）；展开单条样本可查看
   基线/当前两侧的校验结论，失败侧列出全部 Ajv 错误（JSON Pointer、关键字、信息、规则路径）。
 - 重新归纳或更换基线后，旧扫描结果会自动失效清空，需重新扫描。
+
+## 历史样本迁移：规划、原子执行与冲突处理
+
+迁移在 **http://localhost:8080** 页面的「④ 契约演进 → 历史样本迁移」卡片进行（复用会话中的
+基线与当前 Schema），也可直接调用 `POST /api/migrate`。后端分两个阶段工作：
+
+**阶段一 · 规划（与具体样本无关，任一问题整体拒绝，HTTP 422，逐条映射给出原因）**
+
+- 源/目标都须是合法 JSON Pointer（RFC 6901，`~0`/`~1` 转义，空串 `""` 或单段 `/` 表示样本根；
+  目标端额外支持单段 `-` 表示向数组追加）。
+- 不允许两条映射的**源路径相同**或**具体目标路径相同**（同一数组的多个 `-` 追加除外——每次
+  追加占用独立槽位）。
+- 不允许**跨映射源/目标嵌套**：一条映射的源是另一条目标的祖先（或反之），因为被移动的子树与
+  写入位置会是同一批节点，无法定义原子结果。根路径 `""` 是所有路径的祖先，只能作为唯一映射。
+- **允许**源路径之间的父子重叠（执行时按深度从深到浅解析）与目标路径之间的嵌套
+  （执行时按深度从浅到深创建并合并）。
+- 源与目标相同且**未**配默认值的映射没有意义，会被拒绝；配了默认值则表示「该路径有值则保留、
+  缺失则补默认值」。
+
+**阶段二 · 逐条样本原子执行**
+
+| 情况 | 处理 |
+| --- | --- |
+| 源路径在样本中存在 | **移动**：从原位置剪切（含整个子树），粘贴到目标；中间缺失的对象/数组自动创建（下一段是下标/`-` 时建数组，否则建对象） |
+| 源缺失且配了默认值 | **补值**：把默认值（任意 JSON）写入目标 |
+| 源缺失且无默认值 | **跳过**（该条映射 no-op） |
+| 移动的目标已存在值 | **冲突**，绝不覆盖；该样本所有操作回滚、保持原样 |
+| 补值的目标已存在值 | **保留原值**（该条映射标记 skipped） |
+| 结构不兼容 | **冲突**：向对象用 `-`、向数组写非下标键、穿过标量/null 继续写入、具体下标越界（`-` 可安全追加）、`-` 后继续嵌套等 |
+| 数组删除多个元素 | 按**下标从大到小**剪切，先删高位不影响低位下标 |
+| 父子源同时被移动 | 先移子节点再移父节点，每个值恰好落到一个位置（父节点不再包含被单独移走的子节点） |
+
+- **原子性**：每条样本先在深拷贝上执行完整计划，任一操作冲突即丢弃拷贝，响应中该样本
+  `status: "conflict"`、`after: null`、`before` 为原样本，并在 `reason` 与 `operations[].detail`
+  说明冲突的映射与原因，未执行的操作标记为「未执行」。
+- **校验与汇总**：每条结果都用 Ajv 同时给出**迁移前按基线**与**迁移后按当前** Schema 的校验
+  结论（含 JSON Pointer、关键字、信息、规则路径）。顶层汇总为
+  `{ migrated, conflict, noop, valid, invalid }`；界面把 `migrated` 再按当前 Schema 校验结果
+  拆为「成功」与「校验失败」。`successfulSamples` 恰好包含「迁移成功且通过当前 Schema」的文档，
+  供「复制仅成功结果」使用。
+- **限制**：单次最多 **200** 条样本、**20** 条映射；请求形状错误返回 `400`，Schema 无法编译
+  返回 `422`，映射规划失败返回 `422` 并携带 `mappingErrors`。重新归纳或更换基线后旧结果自动失效。
 
 ## 发布门禁：判定规则
 
@@ -293,7 +350,7 @@ npm run dev:client   # 前端 http://localhost:5173（/api 代理到 8080）
 ## 测试
 
 ```bash
-npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、样本贡献度、事件变体契约、匿名化导出、契约切片、HTTP API 与发布门禁（163 项）
+npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、历史样本迁移、样本贡献度、事件变体契约、匿名化导出、契约切片、HTTP API 与发布门禁（200 项：server 187 + client 13）
 ```
 
 ## API
@@ -310,6 +367,7 @@ npm test             # node:test，覆盖归纳引擎、契约比较器、反例
 | POST | `/api/variant` | `{ samples: [<any>, ...], pointer: "/type" }`（≤ 200 条） | `{ pointer, totalSamples, validSamples, groupCount, groups: [{ value, count, sampleIndexes, schema, paths }], skipped: [{ index, reason }], schema: { $schema, oneOf } }`；有效分组不足 2 个或 Pointer 非法时返回 422，响应体仍携带分组概要与跳过明细 |
 | POST | `/api/anonymize` | `{ samples: [<any>, ...], rules: ["/email", "/tags/*"] }`（≤ 200 条） | `{ totalSamples, rules: [{ index, pattern, status, hits, paths, pathsTruncated, error }], samples: [<匿名化样本>] }`；非法 Pointer、命中对象/数组或规则间路径冲突时返回 422，响应体仍携带各规则统计 |
 | POST | `/api/slice` | `{ schema: {...}, samples: [<any>, ...], pointers: ["/properties/a", "/properties/tags/items"] }`（样本 ≤ 200 条，Pointer 1–20 个，`""` 表示根） | `{ schema, samples, fieldCount, sampleCount, pointers, ignored: [{ pointer, reason }] }`；Pointer 非法/未命中返回 422 并携带 `invalidPointers`，任一投影样本未通过 Ajv 校验返回 422 并携带 `failures: [{ index, errors }]`，均不产出切片 |
+| POST | `/api/migrate` | `{ oldSchema: {...}, newSchema: {...}, samples: [<any>, ...], mappings: [{ from: "/phone", to: "/mobile", default?: "unknown" }] }`（样本 ≤ 200 条，映射 1–20 条，`"/"` 或 `""` 表示根，目标端支持 `-` 追加） | `{ total, summary: { migrated, conflict, noop, valid, invalid }, samples: [{ index, status, reason, operations: [{ index, from, to, hasDefault, kind, status, detail }], before, after, baseline: { valid, errors }, current: { valid, errors } }], successfulSamples: [<仅成功且通过当前 Schema 的文档>] }`；映射规划失败返回 422 并携带 `mappingErrors: [{ index, from, to, reason }]`，冲突样本 `after: null` 且保持原样 |
 
 示例：
 
@@ -424,6 +482,34 @@ curl -X POST http://localhost:8080/api/slice \
 #    则整体返回 422 并在 failures 中给出样本索引与错误
 ```
 
+把旧样本按 Pointer 映射迁移到当前契约（移动 /phone → /mobile，缺失时补默认值，vip 缺失补 true）：
+
+```bash
+curl -X POST http://localhost:8080/api/migrate \
+  -H 'Content-Type: application/json' \
+  -d '{"oldSchema":{"type":"object","properties":{"id":{"type":"integer"},"phone":{"type":["null","string"]}},"required":["id"]},
+       "newSchema":{"type":"object","properties":{"id":{"type":"integer"},"mobile":{"type":"string"},"vip":{"type":"boolean"}},"required":["id","mobile","vip"]},
+       "samples":[{"id":1,"phone":"138"},{"id":2},{"id":3,"mobile":"x","vip":false}],
+       "mappings":[{"from":"/phone","to":"/mobile","default":"unknown"},
+                  {"from":"/vip","to":"/vip","default":true}]}'
+# -> { "total": 3,
+#      "summary": { "migrated": 2, "conflict": 0, "noop": 1, "valid": 3, "invalid": 0 },
+#      "samples": [
+#        { "index": 0, "status": "migrated",
+#          "operations": [{ "kind": "move", "status": "applied", ... },
+#                         { "kind": "fill", "status": "applied", ... }],
+#          "before": { "id": 1, "phone": "138" },
+#          "after":  { "id": 1, "mobile": "138", "vip": true },
+#          "current": { "valid": true, "errors": [] } },
+#        { "index": 1, "status": "migrated",
+#          "after": { "id": 2, "mobile": "unknown", "vip": true } },
+#        { "index": 2, "status": "noop", "after": null } ],
+#      "successfulSamples": [ { "id": 1, "mobile": "138", "vip": true },
+#                             { "id": 2, "mobile": "unknown", "vip": true } ] }
+# —— 目标已存在值的移动会判为冲突：该样本 after 为 null、保持原样，
+#    reason 形如「映射 1（/phone → /mobile）：目标位置 /mobile 已存在值……；该样本保持原样」
+```
+
 ## 目录结构
 
 ```
@@ -439,7 +525,8 @@ curl -X POST http://localhost:8080/api/slice \
 │   ├── variant.js          # 事件变体契约（判别字段分组 + 逐组归纳 + const 注入，合并 oneOf，单次上限 200 条）
 │   ├── anonymize.js        # 匿名化导出（JSON Pointer + 单段 * 通配递归匹配，跨样本稳定、类型保留的假名替换，单次上限 200 条）
 │   ├── slice.js            # 契约切片（按勾选的 Schema 树 Pointer 裁剪结构 + 投影样本 + Ajv 逐条校验，样本上限 200 条、Pointer 上限 20 个）
-│   ├── app.js              # Express（/api/infer、/api/validate、/api/diff、/api/counterexample、/api/scan、/api/contribution、/api/variant、/api/anonymize、/api/slice、静态托管）
+│   ├── migrate.js          # 历史样本迁移（先按路径深度规划源→目标映射，再逐条样本原子移动/补值；数组、父子重叠、目标冲突处理；Ajv 按当前 Schema 校验，样本上限 200 条、映射上限 20 条）
+│   ├── app.js              # Express（/api/infer、/api/validate、/api/diff、/api/counterexample、/api/scan、/api/migrate、/api/contribution、/api/variant、/api/anonymize、/api/slice、静态托管）
 │   ├── index.js            # 入口：监听 PORT（默认 8080）
 │   └── test/               # node:test 单元与 API 测试
 └── client/
@@ -452,6 +539,7 @@ curl -X POST http://localhost:8080/api/slice \
         ├── components/DiffPanel.jsx     # 契约演进面板：视角切换、破坏性筛选、按 Pointer 分组
         ├── components/CounterexamplePanel.jsx # 反例：样本格式化展示、双侧校验结果、复制按钮
         ├── components/SampleScanPanel.jsx  # 样本影响扫描：数组输入、四分类汇总、单条双侧错误展开
+        ├── components/MigrationPanel.jsx   # 历史样本迁移：源→目标映射编辑（含默认值）、成功/冲突/校验失败/无变化汇总、前后对比展开、复制仅成功结果
         ├── components/ContributionPanel.jsx # 样本贡献度：留一法分析入口、关键/冗余汇总筛选、定位原样本
         ├── components/AnonymizePanel.jsx    # 匿名化导出：规则编辑、命中/未命中/错误预览、复制匿名化样本
         ├── components/SlicePanel.jsx        # 契约切片：可勾选 Schema 树、字段数/样本数预览、分别复制切片 Schema 与投影样本

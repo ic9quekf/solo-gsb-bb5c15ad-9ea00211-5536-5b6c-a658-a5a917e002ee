@@ -11,6 +11,7 @@ const { analyzeContribution } = require("./contribution");
 const { buildVariantContract } = require("./variant");
 const { anonymizeSamples } = require("./anonymize");
 const { buildSlice } = require("./slice");
+const { migrateSamples } = require("./migrate");
 
 function createApp() {
   const app = express();
@@ -178,6 +179,24 @@ function createApp() {
     const { schema, samples, pointers } = req.body || {};
     try {
       res.json(buildSlice({ schema, samples, pointers }));
+    } catch (err) {
+      const status = err.status && err.status < 500 ? err.status : 500;
+      res.status(status).json({
+        error: status === 500 ? "Internal server error" : err.message,
+        ...(err.details || {}),
+      });
+    }
+  });
+
+  // Historical sample migration: plan "source JSON Pointer -> target JSON
+  // Pointer" moves/default fills by path depth, apply the plan atomically
+  // to each old sample (arrays, parent/child overlap and target conflicts
+  // handled; conflicting samples stay untouched), then validate every
+  // result against the current schema with Ajv.
+  app.post("/api/migrate", (req, res) => {
+    const { oldSchema, newSchema, samples, mappings } = req.body || {};
+    try {
+      res.json(migrateSamples({ oldSchema, newSchema, samples, mappings }));
     } catch (err) {
       const status = err.status && err.status < 500 ? err.status : 500;
       res.status(status).json({
